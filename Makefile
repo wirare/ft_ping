@@ -2,7 +2,7 @@
 CXX := clang
 OPT_FLAGS := -O3 -march=native -mtune=native -funroll-loops -fvectorize -ffp-contract=fast -freciprocal-math -ffast-math -fstrict-aliasing -flto=full -mprefer-vector-width=256 -fomit-frame-pointer
 
-CXXFLAGS := -Wall -Werror -Wextra #-pthread $(OPT_FLAGS)
+CXXFLAGS := -Wall -Werror -Wextra -g#-pthread $(OPT_FLAGS)
 CPPFLAGS := -Iincludes
 
 # Directories
@@ -25,7 +25,7 @@ $(TARGET): $(OBJFILES)
 	$(CXX) $(CXXFLAGS) $(OBJFILES) -o $(TARGET)
 
 # Compile .c to .o
-$(OBJDIR)/%.o: $(SRCDIR)/%.cpp | $(OBJDIR)
+$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	@echo "Compiling $<..."
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c $< -o $@
 
