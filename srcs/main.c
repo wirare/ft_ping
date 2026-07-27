@@ -117,17 +117,27 @@ int receive_msg(int fd, uint16_t id, uint16_t sequence, uint16_t checksum)
 	if (received < 20)
 		ERROR_AND_EXIT("Response too short");
 
-	uint8_t version = receive_buffer[0] >> 4;
-	uint8_t ihl = receive_buffer[0] & 0x0F;
-	uint16_t ip_header_length = ihl * 4;
+	struct iphdr ip;
 
-	if (version != 4)
+	memcpy(&ip, receive_buffer, sizeof(struct iphdr));
+
+	uint16_t ip_header_length = ip.ihl * 4;
+	uint16_t ip_total_length = ntohs(ip.tot_len);
+
+	if (ip.version != 4)
 		ERROR_AND_EXIT("Wrong version");
-	if (ihl < 5)
+	if (ip.ihl < 5)
 		ERROR_AND_EXIT("ihl too short");
-	if (ip_header_length > received)
+	if ((ssize_t)ip_header_length > received)
 		ERROR_AND_EXIT("Weird ip header length");
-	if (received < (ssize_t)(ip_header_length + sizeof(struct icmphdr) + sizeof(uint64_t)))
+	if ((ssize_t)ip_total_length > received)
+		ERROR_AND_EXIT("Truncated IP packet");
+	if (ip_total_length < ip_header_length)
+		ERROR_AND_EXIT("Invalid IP total length");
+
+	size_t icmp_length = ip_total_length - ip_header_length;
+
+	if (icmp_length < sizeof(struct icmphdr) + sizeof(uint64_t))
 		ERROR_AND_EXIT("No icmphdr/timestamp in response");
 
 	uint8_t *icmp_bytes = receive_buffer + ip_header_length;
@@ -148,7 +158,7 @@ int receive_msg(int fd, uint16_t id, uint16_t sequence, uint16_t checksum)
 	inet_ntop(AF_INET, &sender.sin_addr, sender_addr, sizeof(sender_addr));
 
 	uint64_t current_time = get_timestamp();
-	printf("Packet response from %s, time=%.3f ms\n", sender_addr, (double)(current_time - sent_timestamp) / 1000000.0);
+	printf("%zu bytes from %s: icmp_seq=%u ttl=%u time=%.2f ms\n", icmp_length, sender_addr, (unsigned)sequence, (unsigned)ip.ttl, (double)(current_time - sent_timestamp) / 1000000.0);
 	return 0;
 }
 
@@ -188,7 +198,7 @@ void poll_packet(int fd, uint16_t id, uint16_t sequence, uint16_t checksum)
 		current_time = get_timestamp();
 	}
 }
-
+/*
 int main(int ac, char **av)
 {
 	(void)ac;
@@ -221,4 +231,49 @@ int main(int ac, char **av)
 		printf("Packet sent\n");
 
 	poll_packet(fd, id, 0, checksum_ret);
+}
+*/
+
+int main(int ac, char **av)
+{
+	//uint64_t prog_start_timestamp = get_timestamp();
+
+	if (ac != 2)
+		return 1;
+
+	uint16_t pid = (uint16_t)getpid();
+
+	struct sockaddr_in destination = {0};
+
+	destination.sin_family = AF_INET;
+	destination.sin_port = 0;
+
+	int res = inet_pton(AF_INET, av[1], &destination.sin_addr);
+	if (res == 0)
+		ERROR_AND_EXIT("Name or service not known"); //should add the av[1] to the msg
+	else if (res == -1)
+		PERROR_AND_EXIT;
+
+	int fd = open_raw_icmp_socket();
+
+	ssize_t size;
+	uint16_t checksum;
+
+	printf("PING %s (%s) %ld(%ld) bytes of data.\n", av[1], av[1], sizeof(uint64_t), sizeof(struct icmphdr) + sizeof(uint64_t) + sizeof(struct iphdr));
+
+	for (int i = 0; i != 5; i++)
+	{
+		uint64_t send_timestamp = get_timestamp();
+		void *packet = create_icmp_echo_packet(pid, i, send_timestamp, &size, &checksum);
+		ssize_t sent = sendto(fd, packet, size, 0, (const struct sockaddr *)&destination, sizeof(destination));
+		if (sent == -1)
+			PERROR_AND_EXIT;
+		else if (sent != size)
+			ERROR_AND_EXIT("incomplete send");
+
+		poll_packet(fd, pid, i, checksum);
+		sleep(1);
+	}
+
+	printf("--- %s ping statistics ---", av[1]);
 }
