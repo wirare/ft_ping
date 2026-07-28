@@ -1,4 +1,7 @@
 #include <bits/time.h>
+#include <limits.h>
+#include <math.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,13 +20,52 @@
 #define PERROR_AND_EXIT error_and_exit(1, __func__, "")
 #define ERROR_AND_EXIT(msg) error_and_exit(0, __func__, msg)
 
+static volatile sig_atomic_t stop_requested = 0;
+static volatile sig_atomic_t print_requested = 0;
+
+typedef enum
+{
+	OPT_NONE = 0,
+	OPT_VERBOSE = 1 << 0,
+}	e_opt;
+
+struct
+{
+	e_opt opt;	
+
+	void *packet;
+	char packet_is_freed;
+
+	char received;
+	size_t icmp_length;
+	char sender_addr[64];
+	unsigned int ttl;
+	double timing;
+
+	uint64_t prog_start_timestamp;
+
+	size_t loss;
+
+	double *rcv_times;
+	size_t rcv_times_size;
+	size_t rcv_times_idx;
+}	g_statistics;
+
+void __attribute__((noreturn)) quit(int ret)
+{
+	if (g_statistics.packet_is_freed == 0)
+		free(g_statistics.packet);
+	free(g_statistics.rcv_times);
+	exit(ret);
+}
+
 void __attribute__((noreturn)) error_and_exit(int use_perror, const char *fn, const char *err)
 {
 	if (use_perror)
 		perror(fn);
 	else
 		dprintf(2, "%s: %s\n", fn, err);
-	exit(EXIT_FAILURE);
+	quit(EXIT_FAILURE);
 }
 
 int open_raw_icmp_socket()
@@ -154,11 +196,13 @@ int receive_msg(int fd, uint16_t id, uint16_t sequence, uint16_t checksum)
 
 	memcpy(&sent_timestamp, payload, sizeof(sent_timestamp));
 
-	char sender_addr[64];
-	inet_ntop(AF_INET, &sender.sin_addr, sender_addr, sizeof(sender_addr));
+	inet_ntop(AF_INET, &sender.sin_addr, g_statistics.sender_addr, sizeof(g_statistics.sender_addr));
 
 	uint64_t current_time = get_timestamp();
-	printf("%zu bytes from %s: icmp_seq=%u ttl=%u time=%.2f ms\n", icmp_length, sender_addr, (unsigned)sequence, (unsigned)ip.ttl, (double)(current_time - sent_timestamp) / 1000000.0);
+	g_statistics.timing = (double)(current_time - sent_timestamp) / 1000000.0;
+	g_statistics.received = 1;
+	g_statistics.icmp_length = icmp_length;
+	g_statistics.ttl = ip.ttl;
 	return 0;
 }
 
@@ -198,48 +242,95 @@ void poll_packet(int fd, uint16_t id, uint16_t sequence, uint16_t checksum)
 		current_time = get_timestamp();
 	}
 }
-/*
-int main(int ac, char **av)
+
+ double compute_mdev(double *list, size_t size, double average)
 {
-	(void)ac;
+	double mdev = 0;
 
-	uint16_t id = (uint16_t)getpid();
-	uint64_t send_timestamp = get_timestamp();
-	struct sockaddr_in destination = {0};
-	uint16_t checksum_ret;
+	for (size_t i = 0; i != size; i++)
+	{
+		double tmp = list[i] - average;
+		mdev += tmp * tmp;
+	}
 
-	destination.sin_family = AF_INET;
-	destination.sin_port = 0;
+	mdev /= size;
 
-	int res = inet_pton(AF_INET, av[1], &destination.sin_addr);
-	if (res == 0)
-		ERROR_AND_EXIT("input was not a correct ipv4");
-	else if (res == -1)
-		PERROR_AND_EXIT;
-
-	int fd = open_raw_icmp_socket();
-
-	ssize_t size;
-	void *packet = create_icmp_echo_packet(id, 0, send_timestamp, &size, &checksum_ret);
-
-	ssize_t sent = sendto(fd, packet, size, 0, (const struct sockaddr *)&destination, sizeof(destination));
-	if (sent == -1)
-		PERROR_AND_EXIT;
-	else if (sent != size)
-		ERROR_AND_EXIT("incomplete send");
-	else
-		printf("Packet sent\n");
-
-	poll_packet(fd, id, 0, checksum_ret);
+	return sqrt(mdev);
 }
-*/
+
+void print_statistic(int opt)
+{
+	(void)opt;
+	double min = INT_MAX;
+	double max = INT_MIN;
+	double avg = 0;
+	double mdev = 0;
+	size_t size = g_statistics.rcv_times_idx;
+
+	for (size_t i = 0; i != size; i++)
+	{
+		double current = g_statistics.rcv_times[i];
+
+		if (current < min)
+			min = current;
+		
+		if (current > max)
+			max = current;
+
+		avg += current;
+	}
+
+	avg /= size;
+	mdev = compute_mdev(g_statistics.rcv_times, size, avg);
+
+	printf("rtt min/avg/max/mdev = %.03f/%.03f/%.03f/%.03f ms\n", min, avg, max, mdev);
+}
+
+void handle_signals(int signo)
+{
+	if (signo == SIGQUIT)
+		print_requested = 1;
+	else
+		stop_requested = 1;
+}
+
+void setup_signals()
+{
+	struct sigaction sa = {0};
+
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+
+	sa.sa_handler = handle_signals;
+
+	sigaction(SIGQUIT, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+}
+
+void check_sig()
+{
+	if (print_requested)
+	{
+		printf("\n");
+		print_statistic(1);
+		print_requested = 0;
+	}
+	if (stop_requested)
+	{
+		printf("\n");
+		print_statistic(0);
+		quit(EXIT_SUCCESS);
+	}
+}
 
 int main(int ac, char **av)
 {
-	//uint64_t prog_start_timestamp = get_timestamp();
+	g_statistics.prog_start_timestamp = get_timestamp();
 
 	if (ac != 2)
 		return 1;
+
+	setup_signals();
 
 	uint16_t pid = (uint16_t)getpid();
 
@@ -259,21 +350,55 @@ int main(int ac, char **av)
 	ssize_t size;
 	uint16_t checksum;
 
+	g_statistics.rcv_times = malloc(32 * sizeof(double));
+	g_statistics.rcv_times_size = 32;
+	g_statistics.rcv_times_idx = 0;
+
 	printf("PING %s (%s) %ld(%ld) bytes of data.\n", av[1], av[1], sizeof(uint64_t), sizeof(struct icmphdr) + sizeof(uint64_t) + sizeof(struct iphdr));
 
-	for (int i = 0; i != 5; i++)
+	int i = -1;
+	while(1)
 	{
+		i++;
 		uint64_t send_timestamp = get_timestamp();
-		void *packet = create_icmp_echo_packet(pid, i, send_timestamp, &size, &checksum);
-		ssize_t sent = sendto(fd, packet, size, 0, (const struct sockaddr *)&destination, sizeof(destination));
+		g_statistics.packet = create_icmp_echo_packet(pid, i, send_timestamp, &size, &checksum);
+		g_statistics.packet_is_freed = 0;
+		check_sig();
+		ssize_t sent = sendto(fd, g_statistics.packet, size, 0, (const struct sockaddr *)&destination, sizeof(destination));
+		check_sig();
+		free(g_statistics.packet);
+		g_statistics.packet_is_freed = 1;
 		if (sent == -1)
 			PERROR_AND_EXIT;
 		else if (sent != size)
 			ERROR_AND_EXIT("incomplete send");
 
 		poll_packet(fd, pid, i, checksum);
-		sleep(1);
-	}
+		check_sig();
 
-	printf("--- %s ping statistics ---", av[1]);
+		if (g_statistics.received == 0)
+		{
+			g_statistics.loss++;
+			continue;
+		}
+		g_statistics.received = 0;
+
+		printf("%zu bytes from %s: icmp_seq=%u ttl=%u time=%.2f ms\n", g_statistics.icmp_length, 
+																	   g_statistics.sender_addr, 
+																	   i, 
+																	   g_statistics.ttl,
+																	   g_statistics.timing);
+
+		if (g_statistics.rcv_times_idx == g_statistics.rcv_times_size)
+		{
+			g_statistics.rcv_times_size *= 2;
+			g_statistics.rcv_times = realloc(g_statistics.rcv_times, g_statistics.rcv_times_size);
+		}
+
+		g_statistics.rcv_times[g_statistics.rcv_times_idx] = g_statistics.timing;
+		g_statistics.rcv_times_idx++;
+		
+		sleep(1);
+		check_sig();
+	}
 }

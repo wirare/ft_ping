@@ -2,8 +2,9 @@
 CXX := clang
 OPT_FLAGS := -O3 -march=native -mtune=native -funroll-loops -fvectorize -ffp-contract=fast -freciprocal-math -ffast-math -fstrict-aliasing -flto=full -mprefer-vector-width=256 -fomit-frame-pointer
 
-CXXFLAGS := -Wall -Werror -Wextra -g#-pthread $(OPT_FLAGS)
+CXXFLAGS := -Wall -Werror -Wextra -g #$(OPT_FLAGS)
 CPPFLAGS := -Iincludes
+LDFLAGS  := -lm
 
 # Directories
 SRCDIR := srcs
@@ -22,7 +23,7 @@ all: $(TARGET)
 # Link object files into final binary
 $(TARGET): $(OBJFILES)
 	@echo "Linking $(TARGET)..."
-	$(CXX) $(CXXFLAGS) $(OBJFILES) -o $(TARGET)
+	$(CXX) $(CXXFLAGS) $(OBJFILES) $(LDFLAGS) -o $(TARGET)
 
 # Compile .c to .o
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
