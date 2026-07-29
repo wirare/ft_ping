@@ -1,4 +1,5 @@
 #include <bits/time.h>
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
@@ -31,7 +32,9 @@ typedef enum
 
 struct
 {
-	e_opt opt;	
+	e_opt opt;
+
+	char addr[64];
 
 	void *packet;
 	char packet_is_freed;
@@ -45,6 +48,7 @@ struct
 	uint64_t prog_start_timestamp;
 
 	size_t loss;
+	double ewma;
 
 	double *rcv_times;
 	size_t rcv_times_size;
@@ -78,13 +82,14 @@ int open_raw_icmp_socket()
 	PERROR_AND_EXIT;
 }
 
-uint64_t get_timestamp()
+uint64_t get_timestamp(void)
 {
 	struct timespec current;
 
-	clock_gettime(CLOCK_MONOTONIC_RAW, &current);
+	if (clock_gettime(CLOCK_MONOTONIC_RAW, &current) == -1)
+		PERROR_AND_EXIT;
 
-	return current.tv_sec * 1000000  + current.tv_nsec;
+	return ((uint64_t)current.tv_sec * 1000000000ULL) + (uint64_t)current.tv_nsec;
 }
 
 int32_t checksum(const uint8_t *packet, size_t length)
@@ -260,11 +265,9 @@ void poll_packet(int fd, uint16_t id, uint16_t sequence, uint16_t checksum)
 
 void print_statistic(int opt)
 {
-	(void)opt;
 	double min = INT_MAX;
 	double max = INT_MIN;
 	double avg = 0;
-	double mdev = 0;
 	size_t size = g_statistics.rcv_times_idx;
 
 	for (size_t i = 0; i != size; i++)
@@ -281,9 +284,23 @@ void print_statistic(int opt)
 	}
 
 	avg /= size;
-	mdev = compute_mdev(g_statistics.rcv_times, size, avg);
-
-	printf("rtt min/avg/max/mdev = %.03f/%.03f/%.03f/%.03f ms\n", min, avg, max, mdev);
+	
+	size_t loss = g_statistics.loss;
+	size_t total_packet_number = g_statistics.rcv_times_idx;
+	
+	if (opt == 0)
+	{
+		double mdev = compute_mdev(g_statistics.rcv_times, size, avg);
+		printf("--- %s ping statistics ---\n", g_statistics.addr);
+		printf("%zu packets transmitted, %zu received, %.01f%% packets loss, time %lu ms\n", total_packet_number, total_packet_number - loss, loss / (double)total_packet_number, (get_timestamp() - g_statistics.prog_start_timestamp) / 1000000);
+		printf("rtt min/avg/max/mdev = %.03f/%.03f/%.03f/%.03f ms\n", min, avg, max, mdev);
+		return;
+	}
+	if (opt == 1)
+	{
+		printf("%zu/%zu packets, %.01f%% loss, min/avg/ewma/max = %.03f/%.03f/%.03f/%.03f ms\n", total_packet_number - loss, total_packet_number, loss / (double)total_packet_number, min, avg, g_statistics.ewma, max);
+		return;
+	}
 }
 
 void handle_signals(int signo)
@@ -315,12 +332,50 @@ void check_sig()
 		print_statistic(1);
 		print_requested = 0;
 	}
-	if (stop_requested)
+	else if (stop_requested)
 	{
 		printf("\n");
 		print_statistic(0);
 		quit(EXIT_SUCCESS);
 	}
+}
+
+void sleep_full(size_t timer_ms)
+{
+	struct timespec deadline;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &deadline) == -1)
+		PERROR_AND_EXIT;
+
+	deadline.tv_sec += timer_ms / 1000;
+	deadline.tv_nsec += (timer_ms % 1000) * 1000000L;
+
+	if (deadline.tv_nsec >= 1000000000L)
+	{
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+
+	check_sig();
+
+	while (1)
+	{
+		int result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+
+		if (result == 0)
+			break;
+
+		if (result == EINTR)
+		{
+			check_sig();
+			continue;
+		}
+
+		errno = result;
+		PERROR_AND_EXIT;
+	}
+
+	check_sig();
 }
 
 int main(int ac, char **av)
@@ -353,12 +408,15 @@ int main(int ac, char **av)
 	g_statistics.rcv_times = malloc(32 * sizeof(double));
 	g_statistics.rcv_times_size = 32;
 	g_statistics.rcv_times_idx = 0;
+	g_statistics.ewma = -1;
+	memcpy(g_statistics.addr, av[1], strlen(av[1]));
 
 	printf("PING %s (%s) %ld(%ld) bytes of data.\n", av[1], av[1], sizeof(uint64_t), sizeof(struct icmphdr) + sizeof(uint64_t) + sizeof(struct iphdr));
 
 	int i = -1;
 	while(1)
 	{
+		printf("RESTART\n");
 		i++;
 		uint64_t send_timestamp = get_timestamp();
 		g_statistics.packet = create_icmp_echo_packet(pid, i, send_timestamp, &size, &checksum);
@@ -392,13 +450,16 @@ int main(int ac, char **av)
 		if (g_statistics.rcv_times_idx == g_statistics.rcv_times_size)
 		{
 			g_statistics.rcv_times_size *= 2;
-			g_statistics.rcv_times = realloc(g_statistics.rcv_times, g_statistics.rcv_times_size);
+			g_statistics.rcv_times = realloc(g_statistics.rcv_times, g_statistics.rcv_times_size * sizeof(double));
 		}
+
+		if (g_statistics.ewma == -1)
+			g_statistics.ewma = g_statistics.timing;
+		else
+			g_statistics.ewma = (7/8.0f * g_statistics.ewma) + (1/8.0f) * g_statistics.timing;
 
 		g_statistics.rcv_times[g_statistics.rcv_times_idx] = g_statistics.timing;
 		g_statistics.rcv_times_idx++;
-		
-		sleep(1);
-		check_sig();
+		sleep_full(1000);	
 	}
 }
