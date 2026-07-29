@@ -416,7 +416,6 @@ int main(int ac, char **av)
 	int i = -1;
 	while(1)
 	{
-		printf("RESTART\n");
 		i++;
 		uint64_t send_timestamp = get_timestamp();
 		g_statistics.packet = create_icmp_echo_packet(pid, i, send_timestamp, &size, &checksum);
