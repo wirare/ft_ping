@@ -19,7 +19,6 @@ typedef struct
 	void *packet;
 	char packet_is_freed;
 
-	char received;
 	size_t icmp_length;
 	char sender_addr[64];
 	unsigned int ttl;
@@ -30,12 +29,19 @@ typedef struct
 
 	uint64_t prog_start_timestamp;
 
-	size_t loss;
-	double ewma;
+	size_t received_unique;
+	size_t duplicates;
 
-	double *rcv_times;
-	size_t rcv_times_size;
-	size_t rcv_times_idx;
+	size_t rtt_count;
+	double rtt_min;
+	double rtt_max;
+	double rtt_sum;
+	double rtt_sum_squared;
+
+	char is_duplicate;
+
+	uint8_t sequence_state[UINT16_MAX + 1U];
+
 }	t_data;
 
 typedef struct

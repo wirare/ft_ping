@@ -6,10 +6,11 @@
 /*   By: eliot <eliot@42angouleme.fr>               +#+  +:+       +#+        */
 /*                                                +#+#+#+#+#+   +#+           */
 /*   Created: 2026/08/12 11:38:58 by eliot             #+#    #+#             */
-/*   Updated: 2026/08/12 17:00:29 by eliot            ###   ########.fr       */
+/*   Updated: 2026/08/17 12:17:36 by eliot            ###   ########.fr       */
 /*                                                                            */
 /* ************************************************************************** */
 
+#include <asm-generic/errno.h>
 #include <bits/time.h>
 #include <errno.h>
 #include <limits.h>
@@ -45,7 +46,6 @@ void __attribute__((noreturn)) quit(int ret)
 	if (g_statistics.packet_is_freed == 0)
 		free(g_statistics.packet);
 	free(g_statistics.addr);
-	free(g_statistics.rcv_times);
 	exit(ret);
 }
 
@@ -56,6 +56,105 @@ void __attribute__((noreturn)) error_and_exit(int use_perror, const char *fn, co
 	else
 		dprintf(2, "%s: %s\n", fn, err);
 	quit(EXIT_FAILURE);
+}
+
+static void	print_statistics()
+{
+	size_t	lost;
+	int		loss_percent;
+	double	average;
+	double	variance;
+	double	stddev;
+
+	lost = g_statistics.transmitted - g_statistics.received_unique;
+
+	if (g_statistics.transmitted == 0)
+		loss_percent = 0;
+	else
+		loss_percent = (int)(lost * 100 / g_statistics.transmitted);
+
+	printf("--- %s ping statistics ---\n", g_statistics.addr);
+	printf("%zu packets transmitted, %zu packets received, ", g_statistics.transmitted, g_statistics.received_unique);
+
+	if (g_statistics.duplicates != 0)
+		printf("+%zu duplicates, ", g_statistics.duplicates);
+
+	printf("%d%% packet loss\n", loss_percent);
+
+	if (g_statistics.rtt_count == 0)
+		return;
+
+	average = g_statistics.rtt_sum / (double)g_statistics.rtt_count;
+	variance = g_statistics.rtt_sum_squared / (double)g_statistics.rtt_count - average * average;
+	
+	if (variance < 0.0)
+		variance = 0.0;
+
+	stddev = sqrt(variance);
+
+	printf("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
+		g_statistics.rtt_min,
+		average,
+		g_statistics.rtt_max,
+		stddev
+	);
+}
+
+static void	print_live_statistics()
+{
+	size_t	lost;
+	int		loss_percent;
+	double	average;
+
+	if (g_statistics.received_unique > g_statistics.transmitted)
+		lost = 0;
+	else
+		lost = g_statistics.transmitted - g_statistics.received_unique;
+
+	if (g_statistics.transmitted == 0)
+		loss_percent = 0;
+	else
+		loss_percent = (int)(lost * 100 / g_statistics.transmitted);
+
+	printf("%zu/%zu packets, %d%% loss",
+		g_statistics.received_unique,
+		g_statistics.transmitted,
+		loss_percent
+	);
+
+	if (g_statistics.rtt_count != 0)
+	{
+		average = g_statistics.rtt_sum / (double)g_statistics.rtt_count;
+
+		printf(", min/avg/max = %.3f/%.3f/%.3f ms",
+			g_statistics.rtt_min,
+			average,
+			g_statistics.rtt_max
+		);
+	}
+
+	printf("\n");
+}
+
+void check_sig()
+{	
+	if (stop_requested)
+	{
+		stop_requested = 0;
+		printf("\n");
+		print_statistics();
+
+		if (g_statistics.received_unique == 0)
+			quit(EXIT_FAILURE);
+		quit(EXIT_SUCCESS);
+	}
+
+	if (print_requested)
+	{
+		print_requested = 0;
+		printf("\n");
+		print_live_statistics();
+	}
 }
 
 int open_raw_icmp_socket()
@@ -147,7 +246,16 @@ int receive_msg(int fd, uint16_t id)
 	ssize_t received = recvfrom(fd, receive_buffer, sizeof(receive_buffer), 0, (struct sockaddr *)&sender, &sender_length);
 
 	if (received < 0)
-		PERROR_AND_EXIT; //Need to change this to handle some kind of "normal" error such as EINTR, EAGAIN or EWOULDBLOCK
+	{
+		if (errno == EINTR)
+		{
+			check_sig();
+			return (1);
+		}
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return (1);
+		PERROR_AND_EXIT;
+	}
 	
 	if (received < 20)
 		ERROR_AND_EXIT("Response too short");
@@ -184,6 +292,27 @@ int receive_msg(int fd, uint16_t id)
 	if (icmp.type != ICMP_ECHOREPLY || icmp.code != 0 || ntohs(icmp.un.echo.id) != id)
 		return 1;
 
+	uint16_t sequence;
+
+	sequence = ntohs(icmp.un.echo.sequence);
+
+	if (g_statistics.sequence_state[sequence] == 0)
+		return 1;
+
+	g_statistics.sequence = sequence;
+
+	if (g_statistics.sequence_state[sequence] == 2)
+	{
+		g_statistics.is_duplicate = 1;
+		g_statistics.duplicates++;
+	}
+	else
+	{
+		g_statistics.is_duplicate = 0;
+		g_statistics.sequence_state[sequence] = 2;
+		g_statistics.received_unique++;
+	}
+
 	uint8_t *payload = icmp_bytes + sizeof(struct icmphdr);
 	uint64_t sent_timestamp;
 
@@ -193,66 +322,30 @@ int receive_msg(int fd, uint16_t id)
 
 	uint64_t current_time = get_timestamp();
 	g_statistics.timing = (double)(current_time - sent_timestamp) / 1000000.0;
-	g_statistics.received = 1;
 	g_statistics.icmp_length = icmp_length;
 	g_statistics.ttl = ip.ttl;
 	g_statistics.sequence = ntohs(icmp.un.echo.sequence);
 	return 0;
 }
 
- double compute_mdev(double *list, size_t size, double average)
+void update_rtt_statistics(double rtt)
 {
-	double mdev = 0;
-
-	for (size_t i = 0; i != size; i++)
+	if (g_statistics.rtt_count == 0)
 	{
-		double tmp = list[i] - average;
-		mdev += tmp * tmp;
+		g_statistics.rtt_min = rtt;
+		g_statistics.rtt_max = rtt;
+	}
+	else
+	{
+		if (rtt < g_statistics.rtt_min)
+			g_statistics.rtt_min = rtt;
+		if (rtt > g_statistics.rtt_max)
+			g_statistics.rtt_max = rtt;
 	}
 
-	mdev /= size;
-
-	return sqrt(mdev);
-}
-
-void print_statistic(int opt)
-{
-	double min = INT_MAX;
-	double max = INT_MIN;
-	double avg = 0;
-	size_t size = g_statistics.rcv_times_idx;
-
-	for (size_t i = 0; i != size; i++)
-	{
-		double current = g_statistics.rcv_times[i];
-
-		if (current < min)
-			min = current;
-		
-		if (current > max)
-			max = current;
-
-		avg += current;
-	}
-
-	avg /= size;
-	
-	size_t loss = g_statistics.loss;
-	size_t total_packet_number = g_statistics.rcv_times_idx;
-	
-	if (opt == 0)
-	{
-		double mdev = compute_mdev(g_statistics.rcv_times, size, avg);
-		printf("--- %s ping statistics ---\n", g_statistics.addr);
-		printf("%zu packets transmitted, %zu received, %.01f%% packets loss, time %lu ms\n", total_packet_number, total_packet_number - loss, loss / (double)total_packet_number, (get_timestamp() - g_statistics.prog_start_timestamp) / 1000000);
-		printf("rtt min/avg/max/mdev = %.03f/%.03f/%.03f/%.03f ms\n", min, avg, max, mdev);
-		return;
-	}
-	if (opt == 1)
-	{
-		printf("%zu/%zu packets, %.01f%% loss, min/avg/ewma/max = %.03f/%.03f/%.03f/%.03f ms\n", total_packet_number - loss, total_packet_number, loss / (double)total_packet_number, min, avg, g_statistics.ewma, max);
-		return;
-	}
+	g_statistics.rtt_sum += rtt;
+	g_statistics.rtt_sum_squared += rtt * rtt;
+	g_statistics.rtt_count++;
 }
 
 void handle_signals(int signo)
@@ -267,29 +360,16 @@ void setup_signals()
 {
 	struct sigaction sa = {0};
 
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;
+	if (sigemptyset(&sa.sa_mask) == -1)
+		PERROR_AND_EXIT;
 
+	sa.sa_flags = 0;
 	sa.sa_handler = handle_signals;
 
-	sigaction(SIGQUIT, &sa, NULL);
-	sigaction(SIGINT, &sa, NULL);
-}
-
-void check_sig()
-{
-	if (print_requested)
-	{
-		printf("\n");
-		print_statistic(1);
-		print_requested = 0;
-	}
-	else if (stop_requested)
-	{
-		printf("\n");
-		print_statistic(0);
-		quit(EXIT_SUCCESS);
-	}
+	if (sigaction(SIGQUIT, &sa, NULL) == -1)
+		PERROR_AND_EXIT;
+	if (sigaction(SIGINT, &sa, NULL) == -1)
+		PERROR_AND_EXIT;
 }
 
 int milliseconds_until(uint64_t deadline)
@@ -350,11 +430,9 @@ int resolve_ipv4(const char *host, struct sockaddr_in *destination, char numeric
 
 static void	record_reply(void)
 {
-	double	*new_times;
-	size_t	new_size;
+	update_rtt_statistics(g_statistics.timing);
 
-	printf(
-		"%zu bytes from %s: icmp_seq=%u ttl=%u time=%.3f ms\n",
+	printf("%zu bytes from %s: icmp_seq=%u ttl=%u time=%.3f ms",
 		g_statistics.icmp_length,
 		g_statistics.sender_addr,
 		g_statistics.sequence,
@@ -362,31 +440,10 @@ static void	record_reply(void)
 		g_statistics.timing
 	);
 
-	if (g_statistics.rcv_times_idx == g_statistics.rcv_times_size)
-	{
-		new_size = g_statistics.rcv_times_size * 2;
-		new_times = realloc(
-			g_statistics.rcv_times,
-			new_size * sizeof(*new_times)
-		);
-		if (new_times == NULL)
-			ERROR_AND_EXIT("reallocation failed");
-		g_statistics.rcv_times = new_times;
-		g_statistics.rcv_times_size = new_size;
-	}
+	if (g_statistics.is_duplicate)
+		printf(" (DUP!)");
 
-	if (g_statistics.ewma < 0.0)
-		g_statistics.ewma = g_statistics.timing;
-	else
-	{
-		g_statistics.ewma =
-			(7.0 / 8.0) * g_statistics.ewma
-			+ (1.0 / 8.0) * g_statistics.timing;
-	}
-
-	g_statistics.rcv_times[g_statistics.rcv_times_idx]
-		= g_statistics.timing;
-	g_statistics.rcv_times_idx++;
+	printf("\n");
 }
 
 void send_echo_request(int fd, const struct sockaddr_in *destination, uint16_t id, uint16_t sequence)
@@ -412,6 +469,7 @@ void send_echo_request(int fd, const struct sockaddr_in *destination, uint16_t i
 	free(g_statistics.packet);
 	g_statistics.packet = NULL;
 	g_statistics.packet_is_freed = 1;
+	g_statistics.sequence_state[sequence] = 1;
 	g_statistics.transmitted++;
 }
 
@@ -505,11 +563,6 @@ int main(int ac, char **av)
 		return EXIT_FAILURE;
 
 	int fd = open_raw_icmp_socket();
-
-	g_statistics.rcv_times = malloc(32 * sizeof(double));
-	g_statistics.rcv_times_size = 32;
-	g_statistics.rcv_times_idx = 0;
-	g_statistics.ewma = -1;
 
 	size_t host_len = strlen(arguments.host);
 
