@@ -6,7 +6,7 @@
 /*   By: eliot <eliot@42angouleme.fr>               +#+  +:+       +#+        */
 /*                                                +#+#+#+#+#+   +#+           */
 /*   Created: 2026/08/12 11:38:58 by eliot             #+#    #+#             */
-/*   Updated: 2026/08/17 12:17:36 by eliot            ###   ########.fr       */
+/*   Updated: 2026/10/12 17:38:23 by eliot            ###   ########.fr       */
 /*                                                                            */
 /* ************************************************************************** */
 
@@ -288,7 +288,6 @@ int receive_msg(int fd, uint16_t id)
 
 	memcpy(&icmp, icmp_bytes, sizeof(struct icmphdr));
 
-	//Should add a check for the checksum
 	if (icmp.type != ICMP_ECHOREPLY || icmp.code != 0 || ntohs(icmp.un.echo.id) != id)
 		return 1;
 
@@ -428,7 +427,7 @@ int resolve_ipv4(const char *host, struct sockaddr_in *destination, char numeric
 	return 0;
 }
 
-static void	record_reply(void)
+void record_reply()
 {
 	update_rtt_statistics(g_statistics.timing);
 
